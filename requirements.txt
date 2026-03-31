@@ -1,0 +1,25 @@
+aiosqlite
+databases
+fastapi
+Jinja2
+python-multipart
+uvicorn
+Pillow
+imgaug
+albumentations
+einops
+gdown
+prefetch-generator
+lmdb
+# pip install -r requirements.txt
+# then run: pip install vietocr --no-deps
+yolov5
+# numpy>=1.18.5
+# opencv-python>=4.1.2
+# Pillow>=7.1.2
+# PyYAML>=5.3.1
+# requests>=2.23.0
+# scipy>=1.4.1
+# torch>=1.7.0
+# torchvision>=0.8.1
+# tqdm>=4.41.0

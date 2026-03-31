@@ -1,0 +1,34 @@
+version: "3.8"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pk178/work:cccd.latest
+    ports:
+      - "8080:8080"
+    environment:
+      - ENV=production
+    volumes:
+      - uploads:/app/sources/Database/uploads
+      - results:/app/sources/static/results
+      - face:/app/sources/static/face
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  uploads:
+  results:
+  face:

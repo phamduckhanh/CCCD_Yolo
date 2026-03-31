@@ -1,0 +1,13 @@
+__pycache__
+*.pyc
+.git
+.gitignore
+.venv
+*.md
+LICENSE
+.vscode
+.idea
+sources/Database/uploads/*
+sources/static/results/*
+sources/static/face/*
+sources/Database/*.db
