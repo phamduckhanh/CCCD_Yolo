@@ -15,18 +15,8 @@ services:
       - results:/app/sources/static/results
       - face:/app/sources/static/face
     restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    read_only: true
     tmpfs:
       - /tmp
-    security_opt:
-      - no-new-privileges:true
 
 volumes:
   uploads:

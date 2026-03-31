@@ -18,6 +18,16 @@ RUN pip install --no-cache-dir \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir vietocr --no-deps
 
+# Pre-download ArcFace model for face verification (avoid runtime download)
+RUN python -c "\
+import urllib.request, zipfile, os; \
+os.makedirs('weights_tmp', exist_ok=True); \
+urllib.request.urlretrieve('https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_sc.zip', 'weights_tmp/buffalo_sc.zip'); \
+zf = zipfile.ZipFile('weights_tmp/buffalo_sc.zip', 'r'); \
+[open('weights_tmp/w600k_mbf.onnx','wb').write(zf.open(n).read()) for n in zf.namelist() if n.endswith('w600k_mbf.onnx')]; \
+zf.close()" && \
+    ls -la weights_tmp/w600k_mbf.onnx
+
 # --- Production stage ---
 FROM python:3.11-slim
 
@@ -33,6 +43,9 @@ RUN apt-get update && \
 # Copy installed packages from builder
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy pre-downloaded ArcFace model
+COPY --from=builder /app/weights_tmp/w600k_mbf.onnx /app/sources/Database/OCR/weights/w600k_mbf.onnx
 
 COPY . /app
 

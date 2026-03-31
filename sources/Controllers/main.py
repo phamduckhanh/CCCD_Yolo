@@ -1,5 +1,6 @@
 import logging
 import os
+import uuid
 
 import numpy as np
 import torch
@@ -47,7 +48,7 @@ FACE_CROP_DIR = cfg.FACE_DIR
 config = Cfg.load_config_from_name("vgg_seq2seq")
 config["cnn"]["pretrained"] = False
 config["device"] = cfg.DEVICE
-config["predictor"]["beamsearch"] = False
+config["predictor"]["beamsearch"] = True   # beam search giúp tăng độ chính xác
 detector = Predictor(config)
 
 
@@ -88,42 +89,17 @@ async def ekyc_page(request: Request):
 
 # ---- ID Card Extraction ----
 
-@app.post("/uploader")
-async def upload(file: UploadFile = File(...)):
-    _clear_directory(UPLOAD_FOLDER)
+async def _run_pipeline(img_path: str):
+    """Core extraction pipeline: Corner -> Align -> Content -> OCR.
 
-    file_location = os.path.join(UPLOAD_FOLDER, file.filename)
-    contents = await file.read()
-    with open(file_location, "wb") as f:
-        f.write(contents)
-
-    INPUT_FILE = os.listdir(UPLOAD_FOLDER)[0]
-    if INPUT_FILE == "NULL":
-        os.remove(os.path.join(UPLOAD_FOLDER, INPUT_FILE))
-        return JSONResponse(status_code=400, content={"message": "No file selected!"})
-    elif INPUT_FILE == "WRONG_EXTS":
-        os.remove(os.path.join(UPLOAD_FOLDER, INPUT_FILE))
-        return JSONResponse(status_code=400, content={"message": "This file is not supported!"})
-
-    return await extract_info()
-
-
-@app.post("/extract")
-async def extract_info(ekyc=False, path_id=None):
-    """Main extraction pipeline: Corner -> Align -> Content -> OCR"""
-    os.makedirs(cfg.UPLOAD_FOLDER, exist_ok=True)
-
-    INPUT_IMG = os.listdir(UPLOAD_FOLDER)
-    if not INPUT_IMG:
-        return JSONResponse(status_code=400, content={"message": "No image uploaded!"})
-
-    img = path_id if ekyc else os.path.join(UPLOAD_FOLDER, INPUT_IMG[0])
-
+    Returns:
+        list[str] on success, or None if content detection failed.
+    """
     # Step 1: Corner detection & perspective transform
-    CORNER = CORNER_MODEL(img)
+    CORNER = CORNER_MODEL(img_path)
     predictions = CORNER.pred[0]
     categories = predictions[:, 5].tolist()
-    IMG = Image.open(img)
+    IMG = Image.open(img_path)
 
     if len(categories) == 4:
         boxes = utils.class_Order(predictions[:, :4].tolist(), categories)
@@ -146,7 +122,7 @@ async def extract_info(ekyc=False, path_id=None):
     logger.info(f"Content detection: {len(categories)} fields, categories={sorted(set(int(c) for c in categories))}")
 
     if len(categories) < 6:
-        return JSONResponse(status_code=422, content={"message": "Missing fields! Detecting content failed!"})
+        return None
 
     boxes = predictions[:, :4].tolist()
 
@@ -168,7 +144,9 @@ async def extract_info(ekyc=False, path_id=None):
     for idx, img_crop in enumerate(sorted(os.listdir(SAVE_DIR))):
         if idx > 0:  # Skip index 0 (face photo)
             img_ = Image.open(os.path.join(SAVE_DIR, img_crop))
+            img_ = utils.preprocess_for_ocr(img_)      # upscale + sharpen
             s = detector.predict(img_)
+            # s = utils.post_process_field(s)             # sửa lỗi số/ngày tháng
             FIELDS_DETECTED.append(s)
 
     # Merge 2-line address if category 7 present and enough fields detected
@@ -179,7 +157,77 @@ async def extract_info(ekyc=False, path_id=None):
             + [FIELDS_DETECTED[8]]
         )
 
-    return JSONResponse(content=jsonable_encoder({"data": FIELDS_DETECTED}))
+    return FIELDS_DETECTED
+
+
+@app.post("/uploader")
+async def upload(file: UploadFile = File(...)):
+    """Dùng bởi web UI — lưu file vào UPLOAD_FOLDER rồi trả {"data": [...]}."""
+    _clear_directory(UPLOAD_FOLDER)
+
+    contents = await file.read()
+    file_location = os.path.join(UPLOAD_FOLDER, file.filename or "upload.jpg")
+    with open(file_location, "wb") as f:
+        f.write(contents)
+
+    fields = await _run_pipeline(file_location)
+    if fields is None:
+        return JSONResponse(status_code=422, content={"message": "Missing fields! Detecting content failed!"})
+
+    return JSONResponse(content=jsonable_encoder({"data": fields}))
+
+
+@app.post("/extract")
+async def extract_info(file: UploadFile = File(...)):
+    """Upload ảnh CCCD, trả về JSON có cấu trúc cố định.
+
+    Request: multipart/form-data, field name = file
+    Response:
+        {
+          "documentNumber": "string",
+          "fullName": "string",
+          "dayOfBirth": "string",
+          "sex": "string",
+          "nationality": "string",
+          "placeOfOrigin": "string",
+          "placeOfResident": "string",
+          "faceMatching": number
+        }
+    """
+    contents = await file.read()
+    if not contents:
+        return JSONResponse(status_code=400, content={"message": "Empty file!"})
+
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+    ext = (file.filename or "upload.jpg").rsplit(".", 1)[-1].lower()
+    tmp_path = os.path.join(UPLOAD_FOLDER, f"_api_{uuid.uuid4().hex}.{ext}")
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(contents)
+        fields = await _run_pipeline(tmp_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+    if fields is None:
+        return JSONResponse(
+            status_code=422,
+            content={"message": "Missing fields! Detecting content failed!"},
+        )
+
+    def _get(i: int) -> str:
+        return fields[i].strip() if len(fields) > i else ""
+
+    return JSONResponse(content={
+        "documentNumber":  _get(0),
+        "fullName":        _get(1),
+        "dayOfBirth":      _get(2),
+        "sex":             _get(3),
+        "nationality":     _get(4),
+        "placeOfOrigin":   _get(5),
+        "placeOfResident": _get(6),
+        "faceMatching":    0,
+    })
 
 
 @app.post("/download")
@@ -192,53 +240,102 @@ async def download(file: str = Form(...)):
 
 # ---- eKYC ----
 
-@app.post("/ekyc/uploader")
-async def get_id_card(id: UploadFile = File(...), img: UploadFile = File(...)):
-    _clear_directory(UPLOAD_FOLDER)
+@app.post("/ekyc/extract")
+async def ekyc_extract(id_card: UploadFile = File(...), person: UploadFile = File(...)):
+    """eKYC: Upload ảnh CCCD + ảnh chụp người, trả về thông tin + độ khớp khuôn mặt.
 
-    id_location = os.path.join(UPLOAD_FOLDER, id.filename)
-    with open(id_location, "wb") as f:
-        f.write(await id.read())
+    Request: multipart/form-data
+        - id_card: ảnh CCCD
+        - person:  ảnh chụp người thật
 
-    img_location = os.path.join(UPLOAD_FOLDER, img.filename)
-    with open(img_location, "wb") as f_:
-        f_.write(await img.read())
+    Response:
+        {
+          "documentNumber": "string",
+          "fullName": "string",
+          "dayOfBirth": "string",
+          "sex": "string",
+          "nationality": "string",
+          "placeOfOrigin": "string",
+          "placeOfResident": "string",
+          "faceMatching": number   // 0.0 – 1.0, > 0.6 là cùng người
+        }
+    """
+    id_bytes = await id_card.read()
+    person_bytes = await person.read()
 
-    INPUT_FILE = os.listdir(UPLOAD_FOLDER)
-    if "NULL_1" in INPUT_FILE and "NULL_2" not in INPUT_FILE:
-        _clear_directory(UPLOAD_FOLDER)
-        return JSONResponse(status_code=400, content={"message": "Missing ID card image!"})
-    elif "NULL_2" in INPUT_FILE and "NULL_1" not in INPUT_FILE:
-        _clear_directory(UPLOAD_FOLDER)
-        return JSONResponse(status_code=400, content={"message": "Missing person image!"})
-    elif "NULL_1" in INPUT_FILE and "NULL_2" in INPUT_FILE:
-        _clear_directory(UPLOAD_FOLDER)
-        return JSONResponse(status_code=400, content={"message": "Missing ID card and person images!"})
+    if not id_bytes:
+        return JSONResponse(status_code=400, content={"message": "Empty ID card image!"})
+    if not person_bytes:
+        return JSONResponse(status_code=400, content={"message": "Empty person image!"})
 
-    id_ext = id.filename.rsplit(".", 1)[-1]
-    new_id_name = os.path.join(UPLOAD_FOLDER, f"id.{id_ext}")
-    os.rename(id_location, new_id_name)
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+    uid = uuid.uuid4().hex
 
-    img_ext = img.filename.rsplit(".", 1)[-1]
-    new_img_name = os.path.join(UPLOAD_FOLDER, f"person.{img_ext}")
-    os.rename(img_location, new_img_name)
+    id_ext = (id_card.filename or "id.jpg").rsplit(".", 1)[-1].lower()
+    person_ext = (person.filename or "person.jpg").rsplit(".", 1)[-1].lower()
+    id_path = os.path.join(UPLOAD_FOLDER, f"_ekyc_id_{uid}.{id_ext}")
+    person_path = os.path.join(UPLOAD_FOLDER, f"_ekyc_person_{uid}.{person_ext}")
 
-    # Face detection
-    FACE = FACE_MODEL(new_img_name)
-    predictions = FACE.pred[0]
-    categories = predictions[:, 5].tolist()
+    try:
+        with open(id_path, "wb") as f:
+            f.write(id_bytes)
+        with open(person_path, "wb") as f:
+            f.write(person_bytes)
 
-    if 0 not in categories:
-        return JSONResponse(status_code=422, content={"message": "No face detected!"})
-    elif categories.count(0) > 1:
-        return JSONResponse(status_code=422, content={"message": "Multiple faces detected!"})
+        # --- 1. OCR pipeline trên ảnh CCCD ---
+        fields = await _run_pipeline(id_path)
+        if fields is None:
+            return JSONResponse(
+                status_code=422,
+                content={"message": "Missing fields! Detecting content failed!"},
+            )
 
-    boxes = predictions[:, :4].tolist()
+        # --- 2. Lấy ảnh khuôn mặt từ CCCD (file 0.jpg trong SAVE_DIR) ---
+        face_cccd_path = os.path.join(SAVE_DIR, "0.jpg")
+        if not os.path.exists(face_cccd_path):
+            return JSONResponse(
+                status_code=422,
+                content={"message": "Cannot extract face from ID card!"},
+            )
+        face_cccd = Image.open(face_cccd_path)
 
-    _clear_directory(FACE_CROP_DIR)
+        # --- 3. Detect khuôn mặt trong ảnh người ---
+        FACE = FACE_MODEL(person_path)
+        predictions = FACE.pred[0]
+        categories = predictions[:, 5].tolist()
 
-    FACE_IMG = Image.open(new_img_name)
-    cropped_image = FACE_IMG.crop((boxes[0]))
-    cropped_image.save(os.path.join(FACE_CROP_DIR, "face_crop.jpg"))
+        if 0 not in categories:
+            return JSONResponse(status_code=422, content={"message": "No face detected in person image!"})
 
-    return await extract_info(ekyc=True, path_id=new_id_name)
+        left, top, right, bottom = predictions[categories.index(0), :4].tolist()
+        # Thêm 20% padding quanh box để alignment có đủ context
+        person_img = Image.open(person_path)
+        pw, ph = person_img.size
+        pad_x = (right - left) * 0.2
+        pad_y = (bottom - top) * 0.2
+        face_person = person_img.crop((
+            max(0, left - pad_x), max(0, top - pad_y),
+            min(pw, right + pad_x), min(ph, bottom + pad_y),
+        ))
+
+        # --- 4. So khớp khuôn mặt ---
+        similarity = utils.compare_faces(face_cccd, face_person)
+
+    finally:
+        for p in (id_path, person_path):
+            if os.path.exists(p):
+                os.remove(p)
+
+    def _get(i: int) -> str:
+        return fields[i].strip() if len(fields) > i else ""
+
+    return JSONResponse(content={
+        "documentNumber":  _get(0),
+        "fullName":        _get(1),
+        "dayOfBirth":      _get(2),
+        "sex":             _get(3),
+        "nationality":     _get(4),
+        "placeOfOrigin":   _get(5),
+        "placeOfResident": _get(6),
+        "faceMatching":    similarity,
+    })
